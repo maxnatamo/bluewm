@@ -9,9 +9,22 @@
 #include <xcb/xcb_icccm.h>
 #include <X11/keysym.h>
 
-#include "config.h"
+#define TABLENGTH(X)	(sizeof(X)/sizeof(*X))
 
-// Variable declarations
+typedef union
+{
+	const char **com;
+	const int i;
+} Arg;
+
+struct key
+{
+	unsigned int mod;
+	xcb_keysym_t keysym;
+	void (*function)(const Arg arg);
+	const Arg arg;
+};
+
 int sigcode;
 
 xcb_connection_t *conn;
@@ -19,16 +32,19 @@ xcb_ewmh_connection_t *ewmh;
 xcb_screen_t *screen;
 xcb_generic_event_t *event;
 xcb_window_t lastfocus;
+xcb_key_symbols_t *keysyms;
 
-// Function declarations.
 static xcb_screen_t * xcb_screen_of_display( xcb_connection_t *, int );
-static void spawn( const char *cmd[] );
+static void spawn( const Arg );
 static void killclient( xcb_window_t * );
 static void mapwindow( xcb_generic_event_t * );
+static void grabkeys( void );
 static void handle_events( void );
 static short setup( int );
 static void run( void );
 static void closewm( void );
+
+#include "config.h"
 
 xcb_screen_t *
 xcb_screen_of_display( xcb_connection_t *con, int screen )
@@ -56,28 +72,23 @@ xcb_get_keysym( xcb_keycode_t keycode )
 	return keysym;
 }
 
-//void
-//spawn( const char *cmd[] )
-//{	
-//	if(fork() == 0)
-//	{
-//		setsid();
-//		execvp( ( (char **) cmd )[0], ( char ** ) cmd );
-//		printf( "%s has been spawned.\n", cmd[0] );
-//	}
-//}
-
-void
-spawn(const char *cmd[])
+void spawn(const Arg arg)
 {
-	if (fork())
-		return;
+	int pid;
+	if((pid = fork()) == 0)
+	{
+		if(fork() == 0)
+		{
+			if(conn)
+				close(  xcb_get_file_descriptor( conn ) );
 
-	if (conn)
-		close(screen->root);
-
-	setsid();
-	execvp((char*)cmd[0], (char**)cmd);
+			setsid();
+			execvp( (char *) arg.com[0], (char **) arg.com );
+		}
+		exit( 0 );
+	} else {
+		printf("Error on opening program with return code %s\n", (char)pid);
+	}
 }
 
 void
@@ -123,27 +134,27 @@ mapwindow( xcb_generic_event_t *e )
 	xcb_change_property( conn, XCB_PROP_MODE_REPLACE, ev -> window, ewmh -> _NET_WM_STATE, ewmh -> _NET_WM_STATE, 32, 2, data);
 }
 
-void
-setfocus(xcb_window_t *window)
+void grabkeys()
 {
-	xcb_set_input_focus(conn, XCB_INPUT_FOCUS_NONE, window, XCB_CURRENT_TIME);
+	xcb_keycode_t *code = NULL;
+	xcb_ungrab_key( conn, XCB_GRAB_ANY, screen -> root, XCB_MOD_MASK_ANY );
+
+	for(int i = 0; i < TABLENGTH(keys); ++i) {
+		if((code = xcb_key_symbols_get_keycode(keysyms, keys[i].keysym))) {
+			xcb_grab_key( conn, 1, screen -> root, keys[i].mod, *code, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC );
+		}
+	}
 }
 
 void
 keypress( xcb_generic_event_t *e )
 {
 	xcb_key_press_event_t *ev 	= (xcb_key_press_event_t *) e;
-	xcb_keysym_t keysym 		= xcb_get_keysym( ev -> detail );
-	xcb_window_t root		= ev -> root;
-
-	switch( keysym )
-	{
-		case XK_Return:		spawn( termcmd );			break;
-		case XK_space:		spawn( menucmd );			break;
-		case XK_b:		spawn( browser );			break;
-		case XK_q:		killclient( &root );			break;
-		default:							break;
-	}
+       	xcb_keysym_t keysym = xcb_key_symbols_get_keysym( keysyms, ev -> detail, 0 );
+        
+       	for(int i = 0; i < TABLENGTH(keys); ++i)
+       		if(keys[i].keysym == keysym && keys[i].mod == ev -> state)
+       			keys[i].function(keys[i].arg);
 }
 
 void
@@ -155,7 +166,6 @@ buttonpress( xcb_generic_event_t *e )
 	{
 		case 1:
 			// Left mouse button.
-			setfocus( ev -> child );
 			break;
 		case 3:
 			// Right mouse button.
@@ -190,7 +200,6 @@ handle_events( void )
 short
 setup( int scrno )
 {
-	// Thanks 2bwm.
 	uint32_t event_mask_pointer[] = { XCB_EVENT_MASK_POINTER_MOTION };
 
 	unsigned int values[1] = {
@@ -205,7 +214,7 @@ setup( int scrno )
 
 	if ( !screen ) {
 		fprintf( stderr, "Failed to retrieve screen of main display.\n" );
-		return 0;
+		return 1;
 	}
 
 	if( !(ewmh = calloc( 1, sizeof( xcb_ewmh_connection_t ) ) ) ) {
@@ -223,10 +232,18 @@ setup( int scrno )
 
 	if(error) {
 		fprintf( stderr, "Failed to change window attributes.\n" );
-		return 0;
+		return 1;
+	}
+	free( error );
+
+	if ( !(keysyms = xcb_key_symbols_alloc( conn )) ) {
+		fprintf( stderr, "Keysyms could not be allocated.\n" );
+		return 1;
 	}
 
-	return 1;
+	grabkeys();
+
+	return 0;
 }
 
 void
@@ -247,7 +264,7 @@ main( int argc, char **argv )
 {
 	int scrno;
 	if( !xcb_connection_has_error( conn = xcb_connect( NULL, &scrno ) ) ) {
-		if( setup( scrno ) == 1 ) {
+		if( setup( scrno ) == 0 ) {
 			run( );
 		} else {
 			fprintf( stderr, "Failed to setup bluewm. Exiting..." );
